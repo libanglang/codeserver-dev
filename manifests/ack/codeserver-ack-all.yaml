@@ -1,0 +1,728 @@
+# ============================================================================
+# ACK 部署清单（合并版）—— 已在真实 ACK 集群验证通过（2026-09-19）
+#
+# 环境前提：命名空间 vtf-tools / 节点池 worker.role=tools + 污点 role=tools
+#           ALB Ingress（IngressClass alb -> AlbConfig alb）
+#           镜像走 docker.1ms.run 镜像站（ACK 节点连不通 Docker Hub）
+#
+# 一次 apply：kubectl apply -f manifests/ack/codeserver-ack-all.yaml
+# 可选组件： manifests/ack/30-buildkitd.yaml（集群内构建镜像，需要 privileged）
+# 详细说明与实测记录： manifests/ack/README.md
+# ============================================================================
+
+
+---
+
+# ============================== 00-namespace.yaml ==============================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vtf-tools
+  labels:
+    app.kubernetes.io/part-of: codeserver
+
+---
+
+# ============================== 05-storage.yaml ==============================
+# ============================================================================
+# 存储：三台开发机各自一块独立的 ESSD 云盘（RWO / 20Gi）
+#
+# 每台一个 PVC，Pod 只挂自己那块盘 —— 跨用户访问在存储层面就不可能发生。
+#
+# ⚠️ 云盘（alicloud-disk-essd-*）是 RWO + **可用区绑定**：
+#   * 同一块盘同一时刻只能挂到一个节点（每台只有 1 个 Pod，所以没问题）
+#   * PV 会创建在 StorageClass 指定的可用区（这里是 hangzhou-k），
+#     CSI 会给 PV 加 nodeAffinity，Pod 只会被调度到该可用区的节点上。
+#     如果 tools 节点池跨多个可用区，Pod 实际只会落在 hangzhou-k 的节点上。
+#   * 换节点时会重新挂载（约 30~60 秒 ContainerCreating），这是 RWO 云盘的正常行为。
+#
+# 单块盘内部布局（由 Deployment 的 initContainer 创建）：
+#   /            -> 挂到容器的 /workspace（你的代码）
+#   .profile/    -> 挂到容器的 /home/coder-profile（扩展、设置、~/.codex、~/.ssh）
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-code-server-lqm
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-code-server-yl
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-code-server-zk
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem
+
+---
+
+# ============================== 12-proxy-config.yaml ==============================
+# ============================================================================
+# 路径前缀剥离用的 nginx 配置（以 ConfigMap 形式挂进每个 code-server Pod 的 sidecar）
+#
+# 为什么需要它：
+#   ACK 上用的是 **ALB Ingress**，没有 nginx 那套 rewrite-target 注解；而 code-server 4.x
+#   已经删掉 --base-path，必须由代理把 /dev/group/vtf/<name> 前缀剥掉再转发给它。
+#   把这件事放进 Pod 内的 nginx sidecar，ALB 只需要做最简单的路径转发，
+#   不依赖 ALB 的重写功能，行为也可控、可本地验证。
+#
+# 每个 Pod 都挂完整配置（三条路径都在），但 ALB 只会把属于它的那条路径转发进来。
+#
+# 要点：
+#   * location 末尾的 "/" + proxy_pass 末尾的 "/" => nginx 会把 location 前缀替换掉
+#     /dev/group/vtf/lqm/stable-x/foo  ->  /stable-x/foo
+#   * 不带结尾斜杠的 URL 直接 301 补上（code-server 页面用相对路径，缺斜杠会 404）
+#   * WebSocket（VS Code 终端/连接）需要 Upgrade 头 + HTTP/1.1 + 长超时
+#   * client_max_body_size 0 => 关闭上传大小限制（默认 1m 会导致大文件上传失败）
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codeserver-proxy
+  namespace: vtf-tools
+data:
+  default.conf: |
+    server {
+      listen 8888;
+      server_name _;
+
+      # 关键：默认 absolute_redirect on 会把相对跳转补成
+      # http://<host>:8888/... （把内部端口暴露出去，用户点跳转会失败）
+      # 关掉后 nginx 直接返回相对 Location，浏览器按自己的地址解析。
+      absolute_redirect off;
+      port_in_redirect off;
+
+      client_max_body_size 0;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+
+      # ---- 不带结尾斜杠 -> 301 补斜杠 ----
+      location = /dev/group/vtf/lqm { return 301 /dev/group/vtf/lqm/; }
+      location = /dev/group/vtf/yl  { return 301 /dev/group/vtf/yl/; }
+      location = /dev/group/vtf/zk  { return 301 /dev/group/vtf/zk/; }
+
+      # ---- 剥前缀后转发给本 Pod 里的 code-server ----
+      location /dev/group/vtf/lqm/ {
+        proxy_pass http://127.0.0.1:8080/;
+      }
+      location /dev/group/vtf/yl/ {
+        proxy_pass http://127.0.0.1:8080/;
+      }
+      location /dev/group/vtf/zk/ {
+        proxy_pass http://127.0.0.1:8080/;
+      }
+
+      # 根路径：ALB 的默认健康检查就是探 "/"，返回 404 会让后端被判不健康 -> ALB 报 503
+      location = / {
+        access_log off;
+        return 200 "ok\n";
+      }
+
+      # 存活探针：sidecar 自身（不依赖 code-server）
+      location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+      }
+
+      # 就绪探针：转发到 code-server 的 /healthz —— 只有应用真的起来了才返回 2xx。
+      # ALB 的健康检查也指向这里，避免 code-server 还在启动时就把流量导进来（会 502）。
+      location = /readyz {
+        access_log off;
+        proxy_pass http://127.0.0.1:8080/healthz;
+      }
+    }
+
+---
+
+# ============================== 15-passwords.yaml ==============================
+# 三台各自的登录密码（和 kind 版一致；想改直接改这里再 apply，然后 rollout restart）
+# 生成强密码的写法见主 README 第 10 节。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: codeserver-passwords
+  namespace: vtf-tools
+type: Opaque
+stringData:
+  lqm: CHANGE_ME_lqm
+  yl: CHANGE_ME_yl
+  zk: CHANGE_ME_zk
+
+---
+
+# ============================== 10-codeserver-apps.yaml ==============================
+# ============================================================================
+# 三台开发机（ACK 版）
+#   codeserver-lqm -> uid 1001 -> 独立 ESSD 盘 -> http://codeserver.example.com/dev/group/vtf/lqm/
+#   codeserver-yl  -> uid 1002 -> 独立 ESSD 盘 -> http://codeserver.example.com/dev/group/vtf/yl/
+#   codeserver-zk  -> uid 1003 -> 独立 ESSD 盘 -> http://codeserver.example.com/dev/group/vtf/zk/
+#
+# 与 kind 版的差异（ACK 特有）：
+#   1) 节点池：nodeSelector worker.role=tools + 容忍污点 role=tools
+#   2) 存储：hostPath → 每台一块独立 ESSD 云盘（pvc-code-server-<name>，RWO/20Gi），
+#      initContainer 以 root 建 .profile 并 chown 到各自的 uid（1001/1002/1003）
+#   3) 访问方式与 kind 版一致：路径式 /dev/group/vtf/<name>（需要 Nginx Ingress 做前缀重写，
+#      见 manifests/ack/20-ingress.yaml 顶部的说明）
+#   4) 镜像：默认用 ACR 内网地址（你的节点连不上 Docker Hub，见 manifests/ack/README.md）
+# ============================================================================
+
+# ------------------------------------------------------------------- lqm -----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeserver-lqm
+  namespace: vtf-tools
+  labels:
+    app.kubernetes.io/name: code-server
+    app.kubernetes.io/instance: codeserver-lqm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: codeserver-lqm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: code-server
+        app.kubernetes.io/instance: codeserver-lqm
+    spec:
+      nodeSelector:
+        worker.role: tools
+      tolerations:
+        - key: role
+          operator: Equal
+          value: tools
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+      initContainers:
+        # 首次部署时建目录 + 设属主（之后跑起来是幂等的）
+        - name: prepare-dirs
+          image: docker.1ms.run/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - mkdir -p /data/.profile && chown -R 1001:1001 /data &&
+              chmod 700 /data /data/.profile
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        # 路径前缀剥离 + 补斜杠，全部在 Pod 内完成（ALB 只做最简单的路径转发）
+        - name: proxy
+          image: docker.1ms.run/library/nginx:1.27-alpine
+          # 容器级 securityContext 覆盖 Pod 级的 runAsUser=1001：
+          # nginx 官方镜像需要 root 才能创建 /var/cache/nginx、写 /var/run/nginx.pid。
+          # 这个容器只挂了 ConfigMap（只读），拿不到别人 PVC 里的东西，所以不影响隔离。
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          ports:
+            - name: proxy
+              containerPort: 8888
+          readinessProbe:
+            # 走 /readyz -> 转发到 code-server /healthz，应用没起来就不会 Ready
+            httpGet:
+              path: /readyz
+              port: proxy
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: proxy-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+        - name: code-server
+          # 镜像三选一（详见 manifests/ack/README.md）：
+          #   当前用 Docker Hub 镜像站（你们已在用 docker.1ms.run 拉 codercom/code-server，实测可用）
+          #   长期建议：推到 ACR 后换成 your-acr-registry-vpc.cn-hangzhou.cr.aliyuncs.com/vtf/tools/codeserver-dev:v1
+          image: docker.1ms.run/<your-dockerhub-user>/codeserver-dev:8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/code-server"]
+          args:
+            - --bind-addr
+            - 0.0.0.0:8080
+            - --auth
+            - password
+            - --disable-telemetry
+            - --cookie-suffix=-lqm
+            - /workspace
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: codeserver-passwords
+                  key: lqm
+            - name: HOME
+              value: /home/coder-profile
+            - name: SHELL
+              value: /bin/bash
+            - name: VSCODE_PROXY_URI
+              value: ./proxy/{{port}}
+            # 镜像里内置的默认是 kind 的 dev 命名空间，这里改成 ACK 的 vtf-tools
+            - name: BUILDKIT_HOST
+              value: tcp://buildkitd.vtf-tools.svc.cluster.local:1234
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: data
+              mountPath: /workspace
+            - name: data
+              mountPath: /home/coder-profile
+              subPath: .profile
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pvc-code-server-lqm
+        - name: proxy-conf
+          configMap:
+            name: codeserver-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeserver-lqm
+  namespace: vtf-tools
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: codeserver-lqm
+  ports:
+    - name: http
+      port: 8080
+      targetPort: proxy   # 指向 Pod 内的 nginx sidecar
+
+# -------------------------------------------------------------------- yl -----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeserver-yl
+  namespace: vtf-tools
+  labels:
+    app.kubernetes.io/name: code-server
+    app.kubernetes.io/instance: codeserver-yl
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: codeserver-yl
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: code-server
+        app.kubernetes.io/instance: codeserver-yl
+    spec:
+      nodeSelector:
+        worker.role: tools
+      tolerations:
+        - key: role
+          operator: Equal
+          value: tools
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 1002
+        runAsGroup: 1002
+      initContainers:
+        - name: prepare-dirs
+          image: docker.1ms.run/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - mkdir -p /data/.profile && chown -R 1002:1002 /data &&
+              chmod 700 /data /data/.profile
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        # 路径前缀剥离 + 补斜杠，全部在 Pod 内完成（ALB 只做最简单的路径转发）
+        - name: proxy
+          image: docker.1ms.run/library/nginx:1.27-alpine
+          # 容器级 securityContext 覆盖 Pod 级的 runAsUser=1001：
+          # nginx 官方镜像需要 root 才能创建 /var/cache/nginx、写 /var/run/nginx.pid。
+          # 这个容器只挂了 ConfigMap（只读），拿不到别人 PVC 里的东西，所以不影响隔离。
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          ports:
+            - name: proxy
+              containerPort: 8888
+          readinessProbe:
+            # 走 /readyz -> 转发到 code-server /healthz，应用没起来就不会 Ready
+            httpGet:
+              path: /readyz
+              port: proxy
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: proxy-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+        - name: code-server
+          image: docker.1ms.run/<your-dockerhub-user>/codeserver-dev:8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/code-server"]
+          args:
+            - --bind-addr
+            - 0.0.0.0:8080
+            - --auth
+            - password
+            - --disable-telemetry
+            - --cookie-suffix=-yl
+            - /workspace
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: codeserver-passwords
+                  key: yl
+            - name: HOME
+              value: /home/coder-profile
+            - name: SHELL
+              value: /bin/bash
+            - name: VSCODE_PROXY_URI
+              value: ./proxy/{{port}}
+            # 镜像里内置的默认是 kind 的 dev 命名空间，这里改成 ACK 的 vtf-tools
+            - name: BUILDKIT_HOST
+              value: tcp://buildkitd.vtf-tools.svc.cluster.local:1234
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: data
+              mountPath: /workspace
+            - name: data
+              mountPath: /home/coder-profile
+              subPath: .profile
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pvc-code-server-yl
+        - name: proxy-conf
+          configMap:
+            name: codeserver-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeserver-yl
+  namespace: vtf-tools
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: codeserver-yl
+  ports:
+    - name: http
+      port: 8080
+      targetPort: proxy   # 指向 Pod 内的 nginx sidecar
+
+# -------------------------------------------------------------------- zk -----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeserver-zk
+  namespace: vtf-tools
+  labels:
+    app.kubernetes.io/name: code-server
+    app.kubernetes.io/instance: codeserver-zk
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: codeserver-zk
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: code-server
+        app.kubernetes.io/instance: codeserver-zk
+    spec:
+      nodeSelector:
+        worker.role: tools
+      tolerations:
+        - key: role
+          operator: Equal
+          value: tools
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 1003
+        runAsGroup: 1003
+      initContainers:
+        - name: prepare-dirs
+          image: docker.1ms.run/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - mkdir -p /data/.profile && chown -R 1003:1003 /data &&
+              chmod 700 /data /data/.profile
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        # 路径前缀剥离 + 补斜杠，全部在 Pod 内完成（ALB 只做最简单的路径转发）
+        - name: proxy
+          image: docker.1ms.run/library/nginx:1.27-alpine
+          # 容器级 securityContext 覆盖 Pod 级的 runAsUser=1001：
+          # nginx 官方镜像需要 root 才能创建 /var/cache/nginx、写 /var/run/nginx.pid。
+          # 这个容器只挂了 ConfigMap（只读），拿不到别人 PVC 里的东西，所以不影响隔离。
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          ports:
+            - name: proxy
+              containerPort: 8888
+          readinessProbe:
+            # 走 /readyz -> 转发到 code-server /healthz，应用没起来就不会 Ready
+            httpGet:
+              path: /readyz
+              port: proxy
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: proxy-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+        - name: code-server
+          image: docker.1ms.run/<your-dockerhub-user>/codeserver-dev:8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/code-server"]
+          args:
+            - --bind-addr
+            - 0.0.0.0:8080
+            - --auth
+            - password
+            - --disable-telemetry
+            - --cookie-suffix=-zk
+            - /workspace
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: codeserver-passwords
+                  key: zk
+            - name: HOME
+              value: /home/coder-profile
+            - name: SHELL
+              value: /bin/bash
+            - name: VSCODE_PROXY_URI
+              value: ./proxy/{{port}}
+            # 镜像里内置的默认是 kind 的 dev 命名空间，这里改成 ACK 的 vtf-tools
+            - name: BUILDKIT_HOST
+              value: tcp://buildkitd.vtf-tools.svc.cluster.local:1234
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: data
+              mountPath: /workspace
+            - name: data
+              mountPath: /home/coder-profile
+              subPath: .profile
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pvc-code-server-zk
+        - name: proxy-conf
+          configMap:
+            name: codeserver-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeserver-zk
+  namespace: vtf-tools
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: codeserver-zk
+  ports:
+    - name: http
+      port: 8080
+      targetPort: proxy   # 指向 Pod 内的 nginx sidecar
+
+---
+
+# ============================== 20-ingress.yaml ==============================
+# ============================================================================
+# ALB Ingress：按路径访问
+#   http://codeserver.example.com/dev/group/vtf/lqm/  -> codeserver-lqm:8080(sidecar)
+#   http://codeserver.example.com/dev/group/vtf/yl/   -> codeserver-yl:8080(sidecar)
+#   http://codeserver.example.com/dev/group/vtf/zk/   -> codeserver-zk:8080(sidecar)
+#
+# 这里 ALB 只做**最朴素的路径转发**，不做任何重写 —— 前缀剥离和补斜杠都在 Pod 内的
+# nginx sidecar 里完成（manifests/ack/12-proxy-config.yaml）。
+# 这么做是因为：code-server 4.x 删掉了 --base-path，必须由代理剥前缀；而 ALB 的重写
+# 机制和 nginx 的 rewrite-target 注解完全不同（ALB 走"转发动作"），写错很难排查。
+# 把逻辑放进 sidecar 后：ALB 侧零特殊配置，行为还可在本地用真实 nginx 验证。
+#
+# 前置：ACK 集群里要有 ALB Ingress 的 IngressClass（通常叫 alb）。
+#   如果还没有，在控制台"路由 → 创建 Ingress"向导走一遍（会自动创建 AlbConfig + IngressClass），
+#   然后再 apply 本文件；或者把现成的 AlbConfig 名称写进 IngressClass 里。
+#
+# 域名：本文件用 codeserver.example.com；解析用 CNAME 指到 ALB 的 DNS 名称。
+#      国内公网域名需要备案；只内网用就把 address-type 改成 intranet。
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codeserver
+  namespace: vtf-tools
+  annotations:
+    # 监听端口与你们现有 ALB 配置保持一致（实例上已配 443/HTTPS + 证书）。
+    # 注意：ALB 的监听是**实例级**的，写错会把 443 干掉，所以这里显式保留 HTTP+HTTPS。
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz       # 由 sidecar 转发到 code-server 的真实健康端点
+    # 不写 address-type：ALB 实例已存在，交给 AlbConfig 管，避免误改实例属性
+    # 不要写 backend-protocol: https —— code-server 是 HTTP，写了会导致 ALB 用 HTTPS 连后端失败
+spec:
+  ingressClassName: alb
+  rules:
+    - host: codeserver.example.com
+      http:
+        paths:
+          - path: /dev/group/vtf/lqm
+            pathType: Prefix
+            backend:
+              service:
+                name: codeserver-lqm
+                port:
+                  number: 8080
+          - path: /dev/group/vtf/yl
+            pathType: Prefix
+            backend:
+              service:
+                name: codeserver-yl
+                port:
+                  number: 8080
+          - path: /dev/group/vtf/zk
+            pathType: Prefix
+            backend:
+              service:
+                name: codeserver-zk
+                port:
+                  number: 8080
+
+# ---------------------------------------------------------------------------
+# 【重要】关于域名与备案（实测踩到）
+#   公网 ALB 的 80 端口会做 ICP 备案校验：域名未备案时，阿里云边缘直接返回
+#     403 Forbidden / Server: Beaver / <title>Non-compliance ICP Filing</title>
+#   这跟集群配置无关。三种处理方式：
+#     a) 给域名做 ICP 备案（企业备案，走阿里云备案系统）—— 之后用 codeserver.example.com 直接访问
+#     b) 改用内网 ALB：AlbConfig/Ingress 的 address-type 设为 intranet，走内网/VPN 访问（不需要备案）
+#     c) 临时用 ALB 自带域名访问（阿里云自己的域名，已备案）—— 在 rules 里再加一段：
+#
+#        - host: alb-xxxxxxxxxxxxxxxx.cn-hangzhou.alb.aliyuncsslb.com
+#          http:
+#            paths:
+#              - {path: /dev/group/vtf/lqm, pathType: Prefix, backend: {service: {name: codeserver-lqm, port: {number: 8080}}}}
+#              - {path: /dev/group/vtf/yl,  pathType: Prefix, backend: {service: {name: codeserver-yl,  port: {number: 8080}}}}
+#              - {path: /dev/group/vtf/zk,  pathType: Prefix, backend: {service: {name: codeserver-zk,  port: {number: 8080}}}}
+#
+#       （本次验证就是用 c) 的方式跑通的：三条路径分别返回 302，cookie 名分别是
+#        code-server-session--lqm / --yl / --zk，证明路由到了正确的 Pod）
+# ---------------------------------------------------------------------------

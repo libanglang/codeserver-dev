@@ -1,0 +1,155 @@
+# ============================================================================
+# 可选组件：BuildKit 构建服务（ACK 版）—— 让 vtf-tools 里的开发机能构建镜像
+#
+# ✅ 已在真实 ACK 集群验证通过（2026-09-19，ACK v1.36.2-aliyun.1 / tools 节点）：
+#    * buildkitd 1/1 Running（本集群允许 privileged）；100Gi ESSD 缓存盘 Bound
+#    * 从开发机镜像里调用 buildctl：第一次构建 + 推送 13s，第二次命中缓存 0s
+#    * 临时 registry 的 tags = ["1","2"] —— 构建与推送都真的成功
+#
+# 与 kind 版的差异：
+#   1) 命名空间 vtf-tools；节点池 worker.role=tools + 容忍污点 role=tools
+#   2) 缓存：hostPath -> 独立 ESSD 云盘 PVC（RWO，单副本刚好；可用区随 StorageClass）
+#   3) 镜像：走 Docker Hub 代理站 docker.1ms.run（ACK 节点连不通 docker.io）
+#   4) **关键**：用 ConfigMap 给 buildkitd 配 registry mirror，
+#      这样 Dockerfile 里写普通的 `FROM alpine:3.20` 也能构建成功；
+#      不配的话 buildkitd 拉不动 Docker Hub 的基础镜像，只能写镜像站前缀
+#
+# 用法（开发机里 BUILDKIT_HOST 已在 10-codeserver-apps.yaml 里设好）：
+#   devbuild -t <registry>/<ns>/<repo>:<tag> .          # 一条命令：构建 + 推送
+#   buildctl --addr tcp://buildkitd.vtf-tools.svc.cluster.local:1234 debug workers
+# 推私有仓库前先登录一次（凭据存在各自 PVC 的 ~/.docker/config.json）：
+#   podman login --authfile ~/.docker/config.json -u <用户名> <registry>
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkitd-config
+  namespace: vtf-tools
+data:
+  buildkitd.toml: |
+    # Docker Hub 走镜像站（ACK 节点连不通 docker.io，不配这个就只能写镜像站前缀的 base image）
+    [registry."docker.io"]
+      mirrors = ["docker.1ms.run"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-buildkitd-cache
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi          # 构建缓存（层缓存、模块缓存），按需调整
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: vtf-tools
+  labels:
+    app: buildkitd
+spec:
+  replicas: 1
+  # 必须 Recreate：缓存目录被两个实例同时占用会锁冲突
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: buildkitd
+  template:
+    metadata:
+      labels:
+        app: buildkitd
+    spec:
+      nodeSelector:
+        worker.role: tools
+      tolerations:
+        - key: role
+          operator: Equal
+          value: tools
+          effect: NoSchedule
+      containers:
+        - name: buildkitd
+          # 镜像来源（节点连不通 Docker Hub，三选一）：
+          #   1) 推到 ACR 后换内网地址（推荐）：
+          #      image: your-acr-registry-vpc.cn-hangzhou.cr.aliyuncs.com/vtf/tools/buildkit:v0.33.0
+          #   2) 用镜像站（当前，实测可拉）
+          #   3) 节点已离线导入：docker.io/moby/buildkit:v0.33.0 + IfNotPresent
+          image: docker.1ms.run/moby/buildkit:v0.33.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --addr
+            - unix:///run/buildkit/buildkitd.sock
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --config
+            - /etc/buildkit/buildkitd.toml
+          securityContext:
+            privileged: true          # 需要建 overlayfs / namespace；本集群验证允许
+          readinessProbe:
+            exec:
+              command: ["buildctl", "debug", "workers"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: cache
+              mountPath: /var/lib/buildkit
+            - name: config
+              mountPath: /etc/buildkit
+              readOnly: true
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: pvc-buildkitd-cache
+        - name: config
+          configMap:
+            name: buildkitd-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: vtf-tools
+  labels:
+    app: buildkitd
+spec:
+  type: ClusterIP
+  selector:
+    app: buildkitd
+  ports:
+    - name: grpc
+      port: 1234
+      targetPort: 1234
+---
+# 只允许同命名空间里的 code-server Pod 访问 buildkitd
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkitd-ingress
+  namespace: vtf-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: buildkitd
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["code-server"]
+      ports:
+        - protocol: TCP
+          port: 1234

@@ -1,0 +1,347 @@
+# ============================================================================
+# 三台开发机（code-server）—— 彼此完全独立
+#
+#   deployment     uid/gid   节点目录(hostPath)      容器内路径    密码     访问路径
+#   codeserver-lqm  1001      /data/group/vtf/lqm    /workspace    CHANGE_ME_lqm  /dev/group/vtf/lqm/
+#   codeserver-yl   1002      /data/group/vtf/yl     /workspace    CHANGE_ME_yl   /dev/group/vtf/yl/
+#   codeserver-zk   1003      /data/group/vtf/zk     /workspace    CHANGE_ME_zk   /dev/group/vtf/zk/
+#
+# 为什么容器内挂到 /workspace 而不是原路径：
+#   如果按节点原路径挂（/data/group/vtf/<name>），容器里就存在 /data/group/vtf 这条路径，
+#   用户能在"打开文件夹"里往上翻到 /data、/data/group（只读，但会看到整个目录结构，
+#   也能看到同一层其它同事的目录名）。挂到独立的 /workspace 后，容器里根本没有 /data，
+#   用户的可见范围就是"自己的工作目录(/workspace) + 只读的系统目录"，路径也短：
+#   URL 会变成 .../zk/?folder=/workspace。
+#   注意：节点上的数据位置没有变，仍然是 /data/group/vtf/<name>。
+#
+# 隔离原理（这三条缺一不可）：
+#   1) 每个实例用**不同的 uid**（1001/1002/1003）：
+#      只用 POSIX 权限做隔离，如果三台都是 uid 1000，那它们对彼此的目录就是"属主"，
+#      0700 也挡不住，会出现"从 zk 能改 lqm 文件"的问题。
+#   2) 每个目录属主 = 对应 uid，权限 0700（由 scripts/02-prepare-worker02.sh 设置）。
+#   3) 各自独立密码 + 独立 cookie 名（--cookie-suffix），避免同一 origin 下登录态串台。
+#
+# 其它要点：
+#   * nodeSelector 把三个 Pod 都钉在 worker02。
+#   * hostPath type=Directory：目录必须已存在（scripts/02 创建），避免 kubelet 建出 root 目录。
+#   * HOME 指向挂载出来的 profile 目录：uid 非 1000 时写不了镜像里的 /home/coder，
+#     实测（uid=1001）这样设置 code-server 启动、登录、终端都正常。
+#   * profile 目录保存扩展与设置，Pod 重建不丢。
+#   * 不用 fsGroup：避免 kubelet 递归 chown hostPath 干扰上面的属主隔离。
+#   * strategy: Recreate —— hostPath 独占语义，避免滚动更新时两个 Pod 同时写同一目录。
+# ============================================================================
+
+# ------------------------------------------------------------------- lqm -----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeserver-lqm
+  namespace: dev
+  labels:
+    app.kubernetes.io/name: code-server
+    app.kubernetes.io/instance: codeserver-lqm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: codeserver-lqm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: code-server
+        app.kubernetes.io/instance: codeserver-lqm
+    spec:
+      nodeSelector:
+        vtf.io/worker: worker02
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: code-server
+          image: vtf/codeserver-dev:8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/code-server"]
+          args:
+            - --bind-addr
+            - 0.0.0.0:8080
+            - --auth
+            - password
+            - --disable-telemetry
+            # 同一域名下三台的 cookie 名必须不同（注意用 --opt=value 形式）
+            - --cookie-suffix=-lqm
+            # 打开的工作目录
+            - /workspace
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: codeserver-passwords
+                  key: lqm
+            # uid!=1000 时镜像里的 /home/coder 不可写，HOME 必须指向挂载目录
+            - name: HOME
+              value: /home/coder-profile
+            - name: SHELL
+              value: /bin/bash
+            - name: VSCODE_PROXY_URI
+              value: ./proxy/{{port}}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: profile
+              mountPath: /home/coder-profile
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/group/vtf/lqm
+            type: Directory
+        - name: profile
+          hostPath:
+            path: /data/group/vtf/.codeserver/lqm
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeserver-lqm
+  namespace: dev
+  labels:
+    app.kubernetes.io/instance: codeserver-lqm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: codeserver-lqm
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+
+# -------------------------------------------------------------------- yl -----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeserver-yl
+  namespace: dev
+  labels:
+    app.kubernetes.io/name: code-server
+    app.kubernetes.io/instance: codeserver-yl
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: codeserver-yl
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: code-server
+        app.kubernetes.io/instance: codeserver-yl
+    spec:
+      nodeSelector:
+        vtf.io/worker: worker02
+      securityContext:
+        runAsUser: 1002
+        runAsGroup: 1002
+      containers:
+        - name: code-server
+          image: vtf/codeserver-dev:8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/code-server"]
+          args:
+            - --bind-addr
+            - 0.0.0.0:8080
+            - --auth
+            - password
+            - --disable-telemetry
+            - --cookie-suffix=-yl
+            - /workspace
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: codeserver-passwords
+                  key: yl
+            - name: HOME
+              value: /home/coder-profile
+            - name: SHELL
+              value: /bin/bash
+            - name: VSCODE_PROXY_URI
+              value: ./proxy/{{port}}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: profile
+              mountPath: /home/coder-profile
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/group/vtf/yl
+            type: Directory
+        - name: profile
+          hostPath:
+            path: /data/group/vtf/.codeserver/yl
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeserver-yl
+  namespace: dev
+  labels:
+    app.kubernetes.io/instance: codeserver-yl
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: codeserver-yl
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+
+# -------------------------------------------------------------------- zk -----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeserver-zk
+  namespace: dev
+  labels:
+    app.kubernetes.io/name: code-server
+    app.kubernetes.io/instance: codeserver-zk
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: codeserver-zk
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: code-server
+        app.kubernetes.io/instance: codeserver-zk
+    spec:
+      nodeSelector:
+        vtf.io/worker: worker02
+      securityContext:
+        runAsUser: 1003
+        runAsGroup: 1003
+      containers:
+        - name: code-server
+          image: vtf/codeserver-dev:8
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/code-server"]
+          args:
+            - --bind-addr
+            - 0.0.0.0:8080
+            - --auth
+            - password
+            - --disable-telemetry
+            - --cookie-suffix=-zk
+            - /workspace
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: codeserver-passwords
+                  key: zk
+            - name: HOME
+              value: /home/coder-profile
+            - name: SHELL
+              value: /bin/bash
+            - name: VSCODE_PROXY_URI
+              value: ./proxy/{{port}}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+          
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: profile
+              mountPath: /home/coder-profile
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/group/vtf/zk
+            type: Directory
+        - name: profile
+          hostPath:
+            path: /data/group/vtf/.codeserver/zk
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeserver-zk
+  namespace: dev
+  labels:
+    app.kubernetes.io/instance: codeserver-zk
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: codeserver-zk
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

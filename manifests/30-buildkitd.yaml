@@ -1,0 +1,110 @@
+# ============================================================================
+# 可选组件：BuildKit 构建服务（让 code-server 容器里能构建镜像）
+#
+# 为什么需要它：
+#   开发机 Pod 是非特权的（uid 1001~1003，用于隔离），在里面直接跑 podman/buildah 会因为
+#   userns/uid_map 限制失败（实测：newuidmap EPERM、vfs 不支持 ignore_chown_errors）。
+#   给 code-server Pod 加特权能绕过，但会破坏三台之间的隔离。
+#   更好的做法：构建交给一个**独立的 BuildKit 服务**，code-server 里只放 buildctl 客户端。
+#   实测（kind）：从 code-server 容器里 buildctl 构建 alpine 镜像并推送到 registry，7 秒完成，
+#   全程不需要特权、不需要 docker daemon。
+#
+# 安全边界：
+#   * 不开 --allow-insecure-entitlement：构建步骤在 BuildKit 自己的沙箱里跑，
+#     用户无法通过 Dockerfile 触达节点文件系统（这是它比"给 Pod 挂 docker.sock"安全的关键）。
+#   * buildkitd 的 1234 端口只给 ClusterIP，配合 NetworkPolicy 只允许开发机 Pod 访问。
+#   * 需要 buildkitd 容器是 privileged（它要建 overlayfs / namespace）；ACK 上要确认节点池/策略允许，
+#     或者改用 rootless 模式（--oci-worker-no-process-sandbox + 相应能力）另行验证。
+#
+# 推 ACK 时的改动：
+#   * volumes 的 hostPath 换成 PVC（storageClass 用 alicloud-disk-essd / nas 都行）
+#   * 如果要给三台各自独立缓存：把 replicas 改成 3 并各自配 PVC（或每台一个 buildkitd）
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: dev
+  labels:
+    app: buildkitd
+spec:
+  replicas: 1
+  # 必须 Recreate：缓存目录被两个实例同时占用会锁冲突（实测报 "another instance running?"）
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: buildkitd
+  template:
+    metadata:
+      labels:
+        app: buildkitd
+    spec:
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.33.0
+          args:
+            - --addr
+            - unix:///run/buildkit/buildkitd.sock
+            - --addr
+            - tcp://0.0.0.0:1234
+          securityContext:
+            privileged: true
+          readinessProbe:
+            exec:
+              command: ["buildctl", "debug", "workers"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: cache
+              mountPath: /var/lib/buildkit
+      volumes:
+        - name: cache
+          hostPath:
+            path: /data/group/vtf/.buildkit-cache
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: dev
+  labels:
+    app: buildkitd
+spec:
+  type: ClusterIP
+  selector:
+    app: buildkitd
+  ports:
+    - name: grpc
+      port: 1234
+      targetPort: 1234
+---
+# 只允许开发机 Pod 访问 buildkitd（其余命名空间/外部一律拒绝）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildkitd-ingress
+  namespace: dev
+spec:
+  podSelector:
+    matchLabels:
+      app: buildkitd
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["code-server"]
+      ports:
+        - protocol: TCP
+          port: 1234

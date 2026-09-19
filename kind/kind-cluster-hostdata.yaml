@@ -1,0 +1,63 @@
+# ============================================================================
+# 【推荐方案 B】在方案 A 的基础上，把 worker02 节点里的 /data 目录
+# 真正落到 WSL 的一个真实目录，避免 "kind delete cluster 把开发数据一起删掉"。
+#
+# 重要背景：
+#   * 用 kind 时，hostPath 指的路径在 "节点容器" 的文件系统里（overlay 层）。
+#   * kind delete cluster 会删掉整个节点容器 => 方案 A 下 /data/group/vtf/* 会全部丢失。
+#   * 加上 extraMounts 后：worker02 容器里的 /data 就是 WSL 的 /home/<you>/vtf-data，
+#     Pod 里依然按 hostPath /data/group/vtf/lqm 挂载，用法完全不变，但数据在 WSL 磁盘上持久化。
+#
+# 使用前：把下面的 hostPath 改成你自己的 WSL 目录（默认 /home/<user>/vtf-data，需先 mkdir）。
+# 创建：kind create cluster --name vtf-dev --config kind/kind-cluster-hostdata.yaml
+# ============================================================================
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: vtf-dev
+
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      # 443 被 Windows 上的 VMware Workstation Server 占用，本方案只走 http，故不映射
+      # - containerPort: 443
+      #   hostPort: 443
+      #   protocol: TCP
+
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "vtf.io/worker=worker01"
+
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "vtf.io/worker=worker02"
+    extraMounts:
+      # hostPath = Docker Desktop 所在的 WSL 宿主机上的真实目录（先 mkdir -p）
+      # containerPath = 节点容器里的 /data，于是 Pod 的 hostPath /data/group/vtf/lqm 就落到真实磁盘
+      - hostPath: /home/<user>/vtf-data
+        containerPath: /data

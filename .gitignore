@@ -1,0 +1,13 @@
+# 从 kind 导出、准备给 Windows / Lens 用的 kubeconfig（只在仓库根目录）
+/kind-*.yaml
+/kind-*.kubeconfig
+# 生成的 code-server 密码
+secrets/
+# 本地数据目录（方案 B 用）
+vtf-data/
+
+# 额外忽略
+*.kubeconfig
+*.pem
+*.key
+.env

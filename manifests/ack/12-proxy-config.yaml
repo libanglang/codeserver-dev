@@ -1,0 +1,81 @@
+# ============================================================================
+# 路径前缀剥离用的 nginx 配置（以 ConfigMap 形式挂进每个 code-server Pod 的 sidecar）
+#
+# 为什么需要它：
+#   ACK 上用的是 **ALB Ingress**，没有 nginx 那套 rewrite-target 注解；而 code-server 4.x
+#   已经删掉 --base-path，必须由代理把 /dev/group/vtf/<name> 前缀剥掉再转发给它。
+#   把这件事放进 Pod 内的 nginx sidecar，ALB 只需要做最简单的路径转发，
+#   不依赖 ALB 的重写功能，行为也可控、可本地验证。
+#
+# 每个 Pod 都挂完整配置（三条路径都在），但 ALB 只会把属于它的那条路径转发进来。
+#
+# 要点：
+#   * location 末尾的 "/" + proxy_pass 末尾的 "/" => nginx 会把 location 前缀替换掉
+#     /dev/group/vtf/lqm/stable-x/foo  ->  /stable-x/foo
+#   * 不带结尾斜杠的 URL 直接 301 补上（code-server 页面用相对路径，缺斜杠会 404）
+#   * WebSocket（VS Code 终端/连接）需要 Upgrade 头 + HTTP/1.1 + 长超时
+#   * client_max_body_size 0 => 关闭上传大小限制（默认 1m 会导致大文件上传失败）
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codeserver-proxy
+  namespace: vtf-tools
+data:
+  default.conf: |
+    server {
+      listen 8888;
+      server_name _;
+
+      # 关键：默认 absolute_redirect on 会把相对跳转补成
+      # http://<host>:8888/... （把内部端口暴露出去，用户点跳转会失败）
+      # 关掉后 nginx 直接返回相对 Location，浏览器按自己的地址解析。
+      absolute_redirect off;
+      port_in_redirect off;
+
+      client_max_body_size 0;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+
+      # ---- 不带结尾斜杠 -> 301 补斜杠 ----
+      location = /dev/group/vtf/lqm { return 301 /dev/group/vtf/lqm/; }
+      location = /dev/group/vtf/yl  { return 301 /dev/group/vtf/yl/; }
+      location = /dev/group/vtf/zk  { return 301 /dev/group/vtf/zk/; }
+
+      # ---- 剥前缀后转发给本 Pod 里的 code-server ----
+      location /dev/group/vtf/lqm/ {
+        proxy_pass http://127.0.0.1:8080/;
+      }
+      location /dev/group/vtf/yl/ {
+        proxy_pass http://127.0.0.1:8080/;
+      }
+      location /dev/group/vtf/zk/ {
+        proxy_pass http://127.0.0.1:8080/;
+      }
+
+      # 根路径：ALB 的默认健康检查就是探 "/"，返回 404 会让后端被判不健康 -> ALB 报 503
+      location = / {
+        access_log off;
+        return 200 "ok\n";
+      }
+
+      # 存活探针：sidecar 自身（不依赖 code-server）
+      location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+      }
+
+      # 就绪探针：转发到 code-server 的 /healthz —— 只有应用真的起来了才返回 2xx。
+      # ALB 的健康检查也指向这里，避免 code-server 还在启动时就把流量导进来（会 502）。
+      location = /readyz {
+        access_log off;
+        proxy_pass http://127.0.0.1:8080/healthz;
+      }
+    }

@@ -1,0 +1,57 @@
+# ============================================================================
+# 存储：三台开发机各自一块独立的 ESSD 云盘（RWO / 20Gi）
+#
+# 每台一个 PVC，Pod 只挂自己那块盘 —— 跨用户访问在存储层面就不可能发生。
+#
+# ⚠️ 云盘（alicloud-disk-essd-*）是 RWO + **可用区绑定**：
+#   * 同一块盘同一时刻只能挂到一个节点（每台只有 1 个 Pod，所以没问题）
+#   * PV 会创建在 StorageClass 指定的可用区（这里是 hangzhou-k），
+#     CSI 会给 PV 加 nodeAffinity，Pod 只会被调度到该可用区的节点上。
+#     如果 tools 节点池跨多个可用区，Pod 实际只会落在 hangzhou-k 的节点上。
+#   * 换节点时会重新挂载（约 30~60 秒 ContainerCreating），这是 RWO 云盘的正常行为。
+#
+# 单块盘内部布局（由 Deployment 的 initContainer 创建）：
+#   /            -> 挂到容器的 /workspace（你的代码）
+#   .profile/    -> 挂到容器的 /home/coder-profile（扩展、设置、~/.codex、~/.ssh）
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-code-server-lqm
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-code-server-yl
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-code-server-zk
+  namespace: vtf-tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: alicloud-disk-essd-hangzhou-k
+  volumeMode: Filesystem

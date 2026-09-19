@@ -1,0 +1,14 @@
+# ============================================================================
+# Kimi / Moonshot 配置（部署到 ~/.codex/kimi.config.toml）
+# 用法：codex --profile kimi
+# 需要环境变量 KIMI_API_KEY（可用 scripts/10-setup-codex.sh 写入 ~/.codex/env）
+# ============================================================================
+model = "kimi-k2.7-code-highspeed"
+model_provider = "kimi"
+model_reasoning_effort = "high"
+
+[model_providers.kimi]
+name = "Kimi (Moonshot)"
+base_url = "https://api.moonshot.cn/v1"
+env_key = "KIMI_API_KEY"
+wire_api = "responses"

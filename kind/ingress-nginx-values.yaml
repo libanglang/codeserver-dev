@@ -1,0 +1,38 @@
+# ============================================================================
+# 可选：用 Helm 安装 ingress-nginx（script 03 默认用官方 kind 清单，不需要这个文件）
+#
+# helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+# helm repo update
+# helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+#   --namespace ingress-nginx --create-namespace \
+#   -f kind/ingress-nginx-values.yaml
+#
+# 要点：hostPort=true 才能在 kind 里从 Windows 访问 80/443；
+#       nodeSelector 命中控制面上的 ingress-ready=true 标签。
+# ============================================================================
+controller:
+  kind: Deployment
+  replicaCount: 1
+  hostPort:
+    enabled: true
+  nodeSelector:
+    ingress-ready: "true"
+    kubernetes.io/os: linux
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Equal
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Equal
+      effect: NoSchedule
+  service:
+    type: ClusterIP
+  watchIngressWithoutClass: false
+  config:
+    proxy-body-size: "0"
+    proxy-read-timeout: "3600"
+    proxy-send-timeout: "3600"
+  metrics:
+    enabled: true
+  admissionWebhooks:
+    enabled: true

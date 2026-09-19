@@ -1,0 +1,18 @@
+# ============================================================================
+# Codex 基础配置（部署到开发机的 ~/.codex/config.toml）
+# 用法：codex --profile deepseek   或   codex --profile kimi
+#   --profile <name> 会把 $CODEX_HOME/<name>.config.toml 叠加到本文件之上
+#
+# 说明：本文件不含任何密钥。密钥通过环境变量提供，环境变量名写在
+#   deepseek.config.toml / kimi.config.toml 的 env_key 里。
+# ============================================================================
+
+# 自定义模型目录：deepseek-flash / kimi-k2.7-code 等 slug 在这里定义
+model_catalog_json = "~/.codex/models.json"
+
+preferred_auth_method = "apikey"
+forced_login_method = "api"
+
+# 开发机里的工作目录是 /workspace，标记为受信任，避免每次都弹信任确认
+[projects."/workspace"]
+trust_level = "trusted"

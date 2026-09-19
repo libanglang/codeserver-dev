@@ -1,0 +1,124 @@
+# ============================================================================
+# 域名 + 路径路由
+#   http://codeserver.example.com/dev/group/vtf/lqm/ -> codeserver-lqm
+#   http://codeserver.example.com/dev/group/vtf/yl/  -> codeserver-yl
+#   http://codeserver.example.com/dev/group/vtf/zk/  -> codeserver-zk
+#
+# 为什么是 rewrite 而不是 --base-path？
+#   code-server 4.x 已经删掉了 --base-path，官方文档给出的子路径做法是"代理层剥离前缀"
+#   （docs/guide.md 里 Caddy 的例子：uri strip_prefix /code + reverse_proxy）。
+#   这里用等价的 ingress-nginx 写法：use-regex + rewrite-target: /$2，
+#   正则 /dev/group/vtf/lqm/(.*) 的 $1 就是剥掉前缀后的剩余路径。
+#
+# 注意结尾斜杠：code-server 的页面用相对路径引用静态资源和 WebSocket，
+# 所以浏览器地址必须以 "/" 结尾；下面的 redirect Ingress 负责把不带斜杠的 URL 301 过去。
+# （主正则故意写成要求 "/" 结尾，这样裸路径 /dev/group/vtf/lqm 不会被它匹配，
+#   否则 nginx 的正则 location 按出现顺序优先，会抢在 redirect 规则之前。）
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codeserver
+  namespace: dev
+  annotations:
+    # 开启正则路径匹配
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    # 把 <前缀> 剥掉后再转发给 code-server
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    # VS Code Web 是长连接 WebSocket，超时时间要给够
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    # 默认 1m 会导致上传大文件 413
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: codeserver.example.com
+      http:
+        paths:
+          - path: /dev/group/vtf/lqm/(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: codeserver-lqm
+                port:
+                  number: 8080
+          - path: /dev/group/vtf/yl/(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: codeserver-yl
+                port:
+                  number: 8080
+          - path: /dev/group/vtf/zk/(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: codeserver-zk
+                port:
+                  number: 8080
+---
+# 不带结尾斜杠 -> 301 跳到带斜杠的地址（Exact 精确匹配，优先级高于上面的正则）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codeserver-redirect-lqm
+  namespace: dev
+  annotations:
+    nginx.ingress.kubernetes.io/permanent-redirect: http://codeserver.example.com/dev/group/vtf/lqm/
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: codeserver.example.com
+      http:
+        paths:
+          - path: /dev/group/vtf/lqm
+            pathType: Exact
+            backend:
+              service:
+                name: codeserver-lqm
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codeserver-redirect-yl
+  namespace: dev
+  annotations:
+    nginx.ingress.kubernetes.io/permanent-redirect: http://codeserver.example.com/dev/group/vtf/yl/
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: codeserver.example.com
+      http:
+        paths:
+          - path: /dev/group/vtf/yl
+            pathType: Exact
+            backend:
+              service:
+                name: codeserver-yl
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codeserver-redirect-zk
+  namespace: dev
+  annotations:
+    nginx.ingress.kubernetes.io/permanent-redirect: http://codeserver.example.com/dev/group/vtf/zk/
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: codeserver.example.com
+      http:
+        paths:
+          - path: /dev/group/vtf/zk
+            pathType: Exact
+            backend:
+              service:
+                name: codeserver-zk
+                port:
+                  number: 8080
